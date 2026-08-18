@@ -8,6 +8,7 @@ so a shared server never leaks one team's drawings into another's view.
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import logging
 import shutil
 import tempfile
@@ -51,6 +52,14 @@ MAX_PREVIEW_DPI = 400.0
 #: likely to run the server out of memory than to produce a usable file.
 MAX_EXPORT_PIXELS = 1_600_000_000
 
+#: Page previews in the Pages panel. Rendered to a target *pixel width* rather
+#: than a fixed DPI so an E-size sheet costs the same as a letter one, then
+#: downsampled: supersampling is what keeps hairline drawing content visible
+#: instead of dropping out between sample points.
+PAGE_THUMB_RENDER_PX = 620
+PAGE_THUMB_DPI_RANGE = (12.0, 96.0)
+PAGE_THUMB_MAX = 190
+
 
 class Session:
     """All per-client state and the widgets bound to it."""
@@ -87,6 +96,10 @@ class Session:
         self._align_keys = None
         #: A never-refreshed container that owns deferred timers.
         self._timer_host = None
+        #: Preview images in the Pages panel, by page index.
+        self.page_thumbs: dict[int, object] = {}
+        self._thumb_cache: dict[int, tuple[tuple, str]] = {}
+        self._thumb_generation = 0
 
     def dispose(self) -> None:
         shutil.rmtree(self.tempdir, ignore_errors=True)
@@ -269,6 +282,79 @@ class Session:
                 ui.button("Create link", icon="link", on_click=publish) \
                     .props("unelevated no-caps")
         dialog.open()
+
+    # -- page previews ---------------------------------------------------
+
+    def thumbnail_dpi(self, index: int) -> float:
+        width_pt, _ = self.project.page_size_points(index)
+        dpi = PAGE_THUMB_RENDER_PX * PDF_UNITS_PER_INCH / max(1.0, width_pt)
+        low, high = PAGE_THUMB_DPI_RANGE
+        return float(min(max(dpi, low), high))
+
+    def thumbnail_key(self, index: int) -> tuple:
+        """Everything that changes what a page's composite looks like.
+
+        Used as a cache key rather than a manual "dirty" flag, because the
+        state that affects a render is mutated from a dozen places and a flag
+        that anyone forgets to set leaves a stale, misleading preview on screen.
+        """
+        project = self.project
+        page = project.pages[index]
+        return (
+            tuple((doc.doc_id, doc.color) for doc in project.docs),
+            tuple(project.sequences[doc.doc_id][index] for doc in project.docs),
+            dataclasses.astuple(project.settings),
+            tuple((patch.rect, tuple(sorted(patch.offsets.items())),
+                   tuple(patch.polygon) if patch.polygon else None)
+                  for patch in page.patches),
+        )
+
+    async def page_thumbnail(self, index: int) -> str:
+        key = self.thumbnail_key(index)
+        cached = self._thumb_cache.get(index)
+        if cached is not None and cached[0] == key:
+            return cached[1]
+
+        rgb = await run.io_bound(self.project.render, index,
+                                 self.thumbnail_dpi(index))
+        url = await run.io_bound(raster_to_data_url, rgb, PAGE_THUMB_MAX)
+        self._thumb_cache[index] = (key, url)
+        return url
+
+    def schedule_thumbnails(self) -> None:
+        self._thumb_generation += 1
+        host = self._timer_host
+        with host if host is not None else nullcontext():
+            ui.timer(0.05, self.fill_thumbnails, once=True)
+
+    async def fill_thumbnails(self) -> None:
+        """Render page previews one at a time, newest request wins.
+
+        Sequential rather than gathered: a 40 sheet set would otherwise fire 40
+        concurrent renders and starve the main viewer, and the previews are
+        more useful appearing progressively than all at once.
+        """
+        token = self._thumb_generation
+        for index in sorted(self.page_thumbs):
+            if token != self._thumb_generation:
+                return  # the panel was rebuilt; those widgets are gone
+            if index >= self.project.page_count:
+                continue
+            try:
+                url = await self.page_thumbnail(index)
+            except Exception:
+                # One page failing to preview should not stop the rest, but it
+                # must not vanish either -- a silently blank panel is
+                # indistinguishable from a panel that is still loading.
+                logging.getLogger("redliner").exception(
+                    "could not render preview for page %d", index + 1)
+                continue
+            image = self.page_thumbs.get(index)
+            if image is not None and token == self._thumb_generation:
+                # Straight into the prop dict: a PNG data URL contains '=' and
+                # ',', which the props string parser splits on.
+                image._props["src"] = url
+                image.update()
 
     def remove_document(self, doc: SourceDoc) -> None:
         self.project.remove_document(doc.doc_id)
@@ -1046,6 +1132,10 @@ def build_page(session: Session) -> None:
 
             def touch(_=None) -> None:
                 session.schedule_render()
+                # Previews are composites too, so a settings change invalidates
+                # them. The generation token makes a slider drag settle on the
+                # last value instead of rendering every intermediate one.
+                session.schedule_thumbnails()
 
             highlight = ui.switch("Highlight changes", value=project.settings.highlight,
                                   on_change=lambda e: (
@@ -1174,7 +1264,7 @@ def build_page(session: Session) -> None:
                          "so the result is searchable without OCR")
 
     # -- right drawer: output pages ---------------------------------------
-    with ui.right_drawer(value=True).props("width=200 bordered").classes("p-2"):
+    with ui.right_drawer(value=True).props("width=240 bordered").classes("p-2"):
         ui.label("Pages").classes("text-base font-medium pb-1")
 
         @ui.refreshable
@@ -1182,18 +1272,44 @@ def build_page(session: Session) -> None:
             if not project.page_count:
                 ui.label("No pages yet").classes("text-sm opacity-60")
                 return
-            with ui.column().classes("w-full gap-1"):
+            session.page_thumbs.clear()
+            with ui.column().classes("w-full gap-2"):
                 for i, page in enumerate(project.pages):
-                    active = "bg-primary/20" if i == session.index else ""
-                    with ui.row().classes(
-                        f"items-center gap-1 w-full no-wrap rounded px-1 {active}"
-                    ):
-                        ui.checkbox(
-                            value=page.export,
-                            on_change=lambda e, p=page: setattr(p, "export", e.value),
-                        ).props("dense").tooltip("Include this page in the export")
-                        ui.button(f"Page {i + 1}", on_click=lambda _, n=i: session.go_to(n)) \
-                            .props("flat dense no-caps align=left").classes("flex-grow")
+                    current = i == session.index
+                    border = ("border-primary" if current
+                              else "border-transparent")
+                    with ui.column().classes(
+                        f"w-full gap-0 rounded border-2 {border} p-1 "
+                        "cursor-pointer hover:bg-white/5"
+                    ).on("click", lambda _, n=i: session.go_to(n)):
+                        with ui.row().classes("items-center gap-1 w-full no-wrap"):
+                            # The checkbox must not also navigate; stopping
+                            # propagation keeps clicking it from changing page.
+                            ui.checkbox(
+                                value=page.export,
+                                on_change=lambda e, p=page, n=i: (
+                                    setattr(p, "export", e.value),
+                                    session.pages_panel.refresh()),
+                            ).props("dense").classes("shrink-0") \
+                                .on("click.stop", lambda: None) \
+                                .tooltip("Include this page in the export")
+                            ui.label(f"Page {i + 1}").classes("text-xs")
+
+                        # Dimmed when the page is not going into the export, so
+                        # the selection is readable at a glance rather than
+                        # needing every checkbox inspected.
+                        opacity = "opacity-100" if page.export else "opacity-30"
+                        # A raw <img>, not ui.image: ui.image renders a Quasar
+                        # q-img which lazy-loads through its own lifecycle and
+                        # left these previews blank even with a valid data URL
+                        # already on the element. Same reason the viewer uses a
+                        # plain img.
+                        thumb = ui.element("img").classes(
+                            f"w-full rounded bg-white {opacity}"
+                        ).style("min-height: 40px")
+                        session.page_thumbs[i] = thumb
+
+            session.schedule_thumbnails()
 
         session.pages_panel = pages_panel
         pages_panel()

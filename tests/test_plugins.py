@@ -398,3 +398,83 @@ def test_builtin_shapes_still_render_without_any_registration() -> None:
     assert "rect" not in SHAPE_SVG
     assert "<rect" in to_svg([Shape(kind="rect", points=[(0.0, 0.0), (9.0, 9.0)])],
                              100, 100)
+
+
+# -- page preview cache -------------------------------------------------
+
+def _preview_session(tmp_path):
+    """A Session-like object exercising only the thumbnail key logic."""
+    from redliner.core.documents import load_document
+    from redliner.core.project import Project
+    from redliner.ui.app import Session
+
+    project = Project(dpi=150)
+    for name in ("a", "b"):
+        project.add_document(load_document(DATA / f"{name}.pdf", name, name))
+
+    class Fake:
+        pass
+
+    fake = Fake()
+    fake.project = project
+    fake.thumbnail_key = Session.thumbnail_key.__get__(fake)
+    fake.thumbnail_dpi = Session.thumbnail_dpi.__get__(fake)
+    return fake
+
+
+def test_preview_key_is_stable_when_nothing_changes(tmp_path) -> None:
+    session = _preview_session(tmp_path)
+    assert session.thumbnail_key(0) == session.thumbnail_key(0)
+
+
+def test_preview_key_follows_document_colour(tmp_path) -> None:
+    """A stale preview showing the old colours is worse than none: the panel is
+    what you use to decide which pages to export."""
+    session = _preview_session(tmp_path)
+    before = session.thumbnail_key(0)
+    session.project.docs[0].color = (0.0, 1.0, 0.0)
+    assert session.thumbnail_key(0) != before
+
+
+def test_preview_key_follows_diff_settings(tmp_path) -> None:
+    from redliner.core.compose import DiffSettings
+
+    session = _preview_session(tmp_path)
+    before = session.thumbnail_key(0)
+    session.project.settings = DiffSettings(highlight=False)
+    assert session.thumbnail_key(0) != before
+
+
+def test_preview_key_follows_alignment(tmp_path) -> None:
+    from redliner.core.align import AlignPatch
+
+    session = _preview_session(tmp_path)
+    before = session.thumbnail_key(0)
+    session.project.pages[0].patches = [
+        AlignPatch(rect=(0.0, 0.0, 100.0, 100.0), offsets={"b": (2.0, 1.0)})
+    ]
+    assert session.thumbnail_key(0) != before
+
+
+def test_preview_key_follows_page_alignment_sequence(tmp_path) -> None:
+    session = _preview_session(tmp_path)
+    before = session.thumbnail_key(0)
+    session.project.insert_blank("a", 0)
+    assert session.thumbnail_key(0) != before
+
+
+def test_preview_dpi_bounds_cost_across_sheet_sizes(tmp_path) -> None:
+    """A fixed DPI would make an E-size sheet cost 16x a letter one; the target
+    is a pixel width so every sheet renders about the same amount."""
+    from redliner.ui.app import PAGE_THUMB_RENDER_PX
+
+    session = _preview_session(tmp_path)
+    widths = []
+    for size in ((612.0, 792.0), (1584.0, 2448.0), (2448.0, 1584.0)):
+        session.project.docs[0].page_sizes = [size]
+        session.project.docs[1].page_sizes = [size]
+        dpi = session.thumbnail_dpi(0)
+        widths.append(size[0] * dpi / 72.0)
+
+    for width in widths:
+        assert width == pytest.approx(PAGE_THUMB_RENDER_PX, rel=0.02)

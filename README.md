@@ -146,6 +146,14 @@ selection and the arrow keys nudge it. Two details worth knowing:
 In-progress shapes and the selection outline both use an animated marching-ants
 dash, so what is being drawn reads differently from what is already committed.
 
+**Page previews.** The Pages panel shows a thumbnail of each composed page, so
+you can see which sheets actually changed before deciding what to export. Pages
+left out of the export are dimmed. Previews are rendered to a target pixel width
+rather than a fixed DPI, so an E-size sheet costs about the same as a letter one,
+and cached against a fingerprint of everything that affects a render -- document
+colours, diff settings, page alignment, magic-align patches -- rather than a
+manual dirty flag that someone eventually forgets to set.
+
 **Progressive preview.** The viewer renders at 100 DPI for responsiveness and
 re-renders at up to 400 DPI as you zoom in, holding your pan and zoom across the
 swap. Pan and zoom themselves are pure browser-side transforms — a server
