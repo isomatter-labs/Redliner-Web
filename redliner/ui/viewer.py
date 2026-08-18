@@ -39,18 +39,43 @@ window.RedlinerViewer = (function () {
 
   /* ---- coordinate helpers ------------------------------------------ */
 
-  function pointsPerPixel(v) {
-    // Screen pixels -> PDF points, accounting for both the render resolution
-    // and the current zoom.
+  // Screen pixels per PDF point, and where the page's origin sits on screen.
+  function mapping(v) {
     const perPt = v.img.naturalWidth / (v.wPt || v.img.naturalWidth);
-    return 1 / (perPt * v.scale);
+    return {k: perPt * v.scale, tx: v.tx, ty: v.ty};
+  }
+
+  // A gesture freezes the mapping it started with. A re-render at a new DPI
+  // changes naturalWidth and v.scale together, and the two do not update in
+  // the same instant -- naturalWidth flips when the new image decodes, v.scale
+  // only in the load handler. A pointermove landing between those two reads a
+  // mismatched pair and converts to a point miles away, which is what made a
+  // freehand stroke jump when the zoom-triggered re-render fired mid-drag.
+  //
+  // Freezing is not an approximation: keep-view re-renders preserve the page's
+  // on-screen position and size exactly, so the mapping captured at
+  // pointerdown stays visually correct for the whole stroke.
+  function activeMapping(v) {
+    return v.frozen || mapping(v);
+  }
+
+  function freezeMapping(v) {
+    v.frozen = mapping(v);
+  }
+
+  function thawMapping(v) {
+    v.frozen = null;
+  }
+
+  function pointsPerPixel(v) {
+    return 1 / activeMapping(v).k;
   }
 
   function toPoints(v, clientX, clientY) {
     const box = v.root.getBoundingClientRect();
-    const perPt = v.img.naturalWidth / (v.wPt || v.img.naturalWidth);
-    return [(clientX - box.left - v.tx) / v.scale / perPt,
-            (clientY - box.top - v.ty) / v.scale / perPt];
+    const m = activeMapping(v);
+    return [(clientX - box.left - m.tx) / m.k,
+            (clientY - box.top - m.ty) / m.k];
   }
 
   function toScreen(v, xPt, yPt) {
@@ -113,7 +138,13 @@ window.RedlinerViewer = (function () {
     // server need to send" actually depends on.
     const rel = v.scale / (v.base || v.scale);
     clearTimeout(v.timer);
-    const send = () => emitEvent('viewer_zoom', {id: v.id, zoom: rel});
+    const send = () => {
+      // Never swap the image out from under an in-progress gesture. The debounce
+      // means a zoom just before drawing would otherwise land mid-stroke.
+      // Re-armed when the gesture ends, so the sharper render still arrives.
+      if (v.gesture) { v.pendingReport = true; return; }
+      emitEvent('viewer_zoom', {id: v.id, zoom: rel});
+    };
     if (immediate) send(); else v.timer = setTimeout(send, 350);
   }
 
@@ -203,7 +234,10 @@ window.RedlinerViewer = (function () {
       const v = {id, root, img: null, overlay: null, preview: null,
                  scale: 1, tx: 0, ty: 0, base: 0, timer: null,
                  tool: null, toolColor: '#d90000', toolWidth: 1.5,
-                 wPt: 0, hPt: 0};
+                 wPt: 0, hPt: 0,
+                 // Gesture state: `frozen` pins the screen<->points mapping for
+                 // the duration of a drag, `gesture` defers zoom reports.
+                 frozen: null, gesture: false, pendingReport: false};
       views[id] = v;
 
       v.overlay = root.querySelector('.rl-overlay');
@@ -260,6 +294,8 @@ window.RedlinerViewer = (function () {
           if (handle) {
             mode = 'handle'; dragHandle = handle.dataset.handle;
             dragId += 1; ox = e.clientX; oy = e.clientY;
+            v.gesture = true;
+            freezeMapping(v);
             return;
           }
           const group = e.target.closest && e.target.closest('g[data-idx]');
@@ -267,6 +303,8 @@ window.RedlinerViewer = (function () {
           if (group) {
             mode = 'shape'; dragHandle = null;
             dragId += 1; ox = e.clientX; oy = e.clientY;
+            v.gesture = true;
+            freezeMapping(v);
           }
           return;
         }
@@ -278,6 +316,8 @@ window.RedlinerViewer = (function () {
             return;
           }
           mode = 'draw';
+          v.gesture = true;
+          freezeMapping(v);
           from = toPoints(v, e.clientX, e.clientY);
           trail = [from];
         } else {
@@ -321,6 +361,15 @@ window.RedlinerViewer = (function () {
         }
         if (mode === 'pan') root.style.cursor = v.tool && v.tool !== 'pan' ? 'crosshair' : 'grab';
         mode = null; from = null; trail = []; dragHandle = null;
+
+        // The gesture is over: unfreeze, and deliver any zoom report that was
+        // held back so the sharper render still arrives.
+        v.gesture = false;
+        thawMapping(v);
+        if (v.pendingReport) {
+          v.pendingReport = false;
+          report(v, true);
+        }
       };
       root.addEventListener('pointerup', stop);
       root.addEventListener('pointercancel', stop);

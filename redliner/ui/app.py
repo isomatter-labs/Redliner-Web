@@ -12,6 +12,7 @@ import shutil
 import tempfile
 import time
 import uuid
+from contextlib import nullcontext
 from pathlib import Path
 
 from nicegui import app, events, run, ui
@@ -80,6 +81,8 @@ class Session:
         # per dialog, which would leave a dead handler behind on every open.
         self._align_drag = None
         self._align_keys = None
+        #: A never-refreshed container that owns deferred timers.
+        self._timer_host = None
 
     def dispose(self) -> None:
         shutil.rmtree(self.tempdir, ignore_errors=True)
@@ -197,7 +200,18 @@ class Session:
     # -- rendering -------------------------------------------------------
 
     def schedule_render(self, keep_view: bool = True) -> None:
-        ui.timer(0.01, lambda: self.render(keep_view), once=True)
+        """Queue a re-render just after the current handler returns.
+
+        The timer is parented to a container that is never refreshed, because
+        `ui.timer` attaches to whatever slot is current and a timer whose parent
+        gets deleted never fires. Refreshing a panel deletes its children --
+        including the button being clicked -- so scheduling from inside, say,
+        the document list would silently drop the render. That was the "deleting
+        a document doesn't regenerate the diff" bug.
+        """
+        host = self._timer_host
+        with host if host is not None else nullcontext():
+            ui.timer(0.01, lambda: self.render(keep_view), once=True)
 
     async def render(self, keep_view: bool = False) -> None:
         if self.viewer is None:
@@ -780,6 +794,11 @@ def build_page(session: Session) -> None:
     from .viewer import ZoomPanViewer
 
     project = session.project
+
+    # Deferred renders are scheduled against this element rather than whatever
+    # slot happens to be open. It is created once here and never refreshed, so a
+    # timer parented to it always survives long enough to fire.
+    session._timer_host = ui.element("div").style("display:none")
 
     # Registered once per client; both are inert until an align dialog claims
     # them. The drag events are throttled and carry a cumulative delta, so a
