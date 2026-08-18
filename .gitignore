@@ -1,0 +1,10 @@
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+dist/
+build/
+*.egg-info/
+
+# Dev server output (see scripts/restart-dev.sh)
+dev-server.log

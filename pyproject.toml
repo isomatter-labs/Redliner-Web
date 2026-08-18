@@ -1,0 +1,31 @@
+[project]
+name = "redliner"
+version = "2.0.0.dev0"
+description = "Per-pixel visual diff for PDFs and drawings, served over the web"
+requires-python = ">=3.11"
+license = "GPL-3.0-or-later"
+license-files = ["LICENSE"]
+dependencies = [
+    "nicegui>=2.0",
+    "pymupdf>=1.24",
+    "numpy>=1.26",
+    "pillow>=10.0",
+    "scipy>=1.11",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0"]
+
+[project.scripts]
+redliner = "redliner.cli:cli"
+
+[build-system]
+# 77+ for PEP 639 `license` as an SPDX expression plus `license-files`.
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["redliner*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
