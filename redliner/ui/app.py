@@ -7,6 +7,7 @@ so a shared server never leaks one team's drawings into another's view.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import shutil
 import tempfile
@@ -26,6 +27,8 @@ from ..core.compose import to_ink
 from ..core.export import ExportOptions, build_pdf, estimate_pixels
 from ..core.markup import FONTS, Shape, to_svg
 from ..core.project import Project, hex_to_rgb, rgb_to_hex
+from ..core import shares
+from .share_routes import SHARE_PREFIX, register as register_share_routes
 from ..plugins import discover_all
 from ..plugins.fetchers import FETCHERS
 from ..plugins.parsers import accepted_extensions
@@ -100,10 +103,20 @@ class Session:
         cannot delete uploads belonging to a concurrently running instance.
         """
         cutoff = time.time() - max_age_hours * 3600
+        # Shared PDFs are long-lived by design and must never be swept as if
+        # they were an abandoned session. They are stored under a name that
+        # does not match the glob below, and this check keeps that true even if
+        # someone points REDLINER_SHARE_DIR somewhere that does.
+        protected = shares.default_root().resolve()
+
         removed = 0
         for path in Path(tempfile.gettempdir()).glob("redliner-*"):
             try:
-                if path.is_dir() and path.stat().st_mtime < cutoff:
+                if not path.is_dir():
+                    continue
+                if path.resolve() == protected:
+                    continue
+                if path.stat().st_mtime < cutoff:
                     shutil.rmtree(path, ignore_errors=True)
                     removed += 1
             except OSError:
@@ -176,6 +189,85 @@ class Session:
             return
         notification.dismiss()
         await self.add_document(paths, name)
+
+    async def share(self) -> None:
+        """Publish the selected pages to a temporary link."""
+        indices = self.project.export_indices()
+        if not indices:
+            ui.notify("No pages are marked for export", type="warning")
+            return
+
+        ttl = {"seconds": shares.DEFAULT_TTL}
+        dpi = {"value": max(self.project.dpi, 200.0)}
+        label = {"text": " vs ".join(d.name for d in self.project.docs) or "redline"}
+
+        with ui.dialog() as dialog, ui.card().classes("w-[520px] max-w-full gap-3"):
+            ui.label("Share a link").classes("text-base font-medium")
+            ui.label(f"{len(indices)} page{'s' if len(indices) != 1 else ''} "
+                     "will be exported and hosted at a temporary URL.") \
+                .classes("text-sm opacity-70")
+
+            name = ui.input("Name", value=label["text"]) \
+                .props("dense outlined").classes("w-full") \
+                .tooltip("Only used for the download filename; the link itself "
+                         "is a random token")
+
+            with ui.row().classes("w-full gap-2 no-wrap"):
+                ui.select({s: t for t, s in shares.TTL_CHOICES},
+                          label="Expires after", value=ttl["seconds"],
+                          on_change=lambda e: ttl.__setitem__("seconds", int(e.value))) \
+                    .props("dense outlined").classes("flex-grow")
+                ui.number("DPI", value=dpi["value"], min=72, max=1200, step=25,
+                          on_change=lambda e: dpi.__setitem__(
+                              "value", float(e.value or 200))) \
+                    .props("dense outlined").classes("w-28") \
+                    .tooltip("Resolution of the shared PDF. The raster is baked "
+                             "in, so pick enough for whoever reviews it.")
+
+            result = ui.column().classes("w-full gap-1")
+
+            async def publish() -> None:
+                label["text"] = name.value or "redline"
+                notification = ui.notification("Building the shared PDF...",
+                                               spinner=True, timeout=None)
+                try:
+                    data = await run.io_bound(
+                        build_pdf, self.project, indices,
+                        ExportOptions(dpi=dpi["value"],
+                                      text_layer=self.text_layer.value,
+                                      title=label["text"]),
+                    )
+                    share = await run.io_bound(
+                        shares.store().create, data, ttl["seconds"],
+                        label["text"], len(indices))
+                except Exception as exc:
+                    notification.dismiss()
+                    ui.notify(f"Could not create the share: {exc}", type="negative")
+                    return
+                notification.dismiss()
+
+                url = f"{await ui.run_javascript('window.location.origin')}" \
+                      f"{SHARE_PREFIX}/{share.token}"
+                result.clear()
+                with result:
+                    ui.label("Link ready").classes("text-sm font-medium")
+                    with ui.row().classes("w-full items-center gap-2 no-wrap"):
+                        field = ui.input(value=url).props("dense outlined readonly") \
+                            .classes("flex-grow")
+                        ui.button(icon="content_copy", on_click=lambda: (
+                            ui.run_javascript(
+                                f"navigator.clipboard.writeText({url!r})"),
+                            ui.notify("Copied", type="positive"))) \
+                            .props("flat dense").tooltip("Copy link")
+                    ui.label(f"Expires in {share.describe_remaining()} · "
+                             f"{share.size / 1e6:.1f} MB · {share.pages} pages") \
+                        .classes("text-xs opacity-60")
+
+            with ui.row().classes("w-full justify-end gap-2"):
+                ui.button("Close", on_click=dialog.close).props("flat no-caps")
+                ui.button("Create link", icon="link", on_click=publish) \
+                    .props("unelevated no-caps")
+        dialog.open()
 
     def remove_document(self, doc: SourceDoc) -> None:
         self.project.remove_document(doc.doc_id)
@@ -814,6 +906,8 @@ def build_page(session: Session) -> None:
         ui.space()
         session.progress = ui.spinner(size="sm")
         session.progress.set_visibility(False)
+        ui.button("Share", icon="link", on_click=session.share) \
+            .props("flat").tooltip("Publish to a temporary link")
         ui.button("Export PDF", icon="download", on_click=session.export) \
             .props("unelevated color=primary")
 
@@ -1313,10 +1407,36 @@ async def index() -> None:
     ui.context.client.on_disconnect(session.dispose)
 
 
+def _start_share_sweeper(interval: float = 600.0) -> None:
+    """Drop expired shares periodically.
+
+    Expiry is also checked when a link is opened, but a share nobody visits
+    again would otherwise sit on disk forever. Sweeping on a timer bounds how
+    long an expired comparison survives regardless of traffic.
+    """
+    store = shares.store()
+    removed = store.sweep()
+    if removed:
+        logging.getLogger("redliner").info("removed %d expired shares", removed)
+
+    @app.on_startup
+    async def _sweeper() -> None:
+        async def loop() -> None:
+            while True:
+                await asyncio.sleep(interval)
+                try:
+                    store.sweep()
+                except Exception:
+                    logging.getLogger("redliner").exception("share sweep failed")
+        asyncio.create_task(loop())
+
+
 def main(host: str = "0.0.0.0", port: int = 8080, reload: bool = False) -> None:
     # Up front, so a broken plugin shows up in the startup log rather than
     # surprising the first person who tries to upload something.
     discover_all()
+    register_share_routes()
+    _start_share_sweeper()
     orphans = Session.sweep_orphans()
     if orphans:
         logging.getLogger("redliner").info(

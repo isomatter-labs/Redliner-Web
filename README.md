@@ -151,6 +151,30 @@ re-renders at up to 400 DPI as you zoom in, holding your pan and zoom across the
 swap. Pan and zoom themselves are pure browser-side transforms — a server
 round-trip per mouse-move would make dragging a large sheet unusable.
 
+## Sharing
+
+**Share** publishes the pages you have marked for export to a temporary URL —
+`/s/<token>` — with a chosen lifetime, from 15 minutes to 30 days.
+
+The link serves a PDF rather than a live viewer. That is deliberate: a live
+share would have to keep your source documents on the server for the whole TTL
+in order to re-render, whereas a PDF exposes only the one composite you chose.
+It is also what reviewers actually want — they open it in Bluebeam or Acrobat,
+mark it up further and attach it to a change order. The searchable text layer
+comes along, so Ctrl+F works in their reader.
+
+Tokens are `uuid4` hex: 122 bits, so shares cannot be found by guessing, and
+validating the shape also stops a token ever being a path traversal. Expiry is
+enforced when a link is opened *and* by a sweeper, so a share nobody revisits
+still goes away.
+
+Shares live on disk (`REDLINER_SHARE_DIR`, default `<temp>/redliner_shares`) so
+a link you have already emailed survives a restart.
+
+**Expiry is hygiene, not revocation.** Anyone who opened a share has the PDF and
+keeps it. Redliner is expected to sit behind a login; that is what controls who
+gets in.
+
 ## Magic align
 
 CAD exporters routinely re-emit a text box or symbol a few points off between
