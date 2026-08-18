@@ -5,7 +5,7 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-from redliner.core.align import (AlignPatch, apply_patches, auto_align,
+from redliner.core.align import (AlignPatch, apply_patches, auto_align, bounds_of,
                                  estimate_shift, normalize_rect, search_radius,
                                  window)
 from redliner.core.compose import DiffSettings, Layer, composite
@@ -384,3 +384,110 @@ def test_region_render_is_cropped_and_difference_only() -> None:
     assert region.shape[1] == pytest.approx(278, abs=2)
     flat = region.reshape(-1, 3)
     assert (flat.max(axis=1) < 40).sum() == 0, "no black: shared ink must drop out"
+
+
+# -- lasso regions ------------------------------------------------------
+
+def test_polygon_mask_covers_only_the_outline() -> None:
+    from redliner.core.align import polygon_mask
+
+    triangle = [(0.0, 0.0), (72.0, 0.0), (0.0, 72.0)]
+    mask = polygon_mask(triangle, (0.0, 0.0), dpi=72, shape=(72, 72))
+
+    assert mask.shape == (72, 72)
+    assert mask[2, 2], "just inside the right angle should be covered"
+    assert not mask[60, 60], "well outside the hypotenuse should not be"
+    # A right triangle is about half the box.
+    assert 0.35 < mask.mean() < 0.65
+
+
+def test_polygon_mask_translates_to_the_window_origin() -> None:
+    from redliner.core.align import polygon_mask
+
+    square = [(100.0, 100.0), (140.0, 100.0), (140.0, 140.0), (100.0, 140.0)]
+    mask = polygon_mask(square, (100.0, 100.0), dpi=72, shape=(40, 40))
+    assert mask.mean() > 0.9, "the window starts at the polygon, so it fills it"
+
+
+def test_degenerate_polygon_covers_everything() -> None:
+    """Fewer than three points is not an outline; treat it as the whole box
+    rather than silently masking the correction away to nothing."""
+    from redliner.core.align import polygon_mask
+
+    mask = polygon_mask([(0.0, 0.0), (10.0, 10.0)], (0.0, 0.0), 72, (10, 10))
+    assert mask.all()
+
+
+def test_lasso_moves_only_what_it_encloses() -> None:
+    """The reason for a blob over a box: a line passing beside the drifting
+    element must stay exactly where it was."""
+    raster = np.full((80, 80), 255, dtype=np.uint8)
+    raster[20:30, 20:30] = 0        # inside the lasso
+    raster[20:30, 60:70] = 0        # outside it, must not move
+    anchor = np.full((80, 80), 255, dtype=np.uint8)
+
+    lasso = [(15.0, 15.0), (40.0, 15.0), (40.0, 40.0), (15.0, 40.0)]
+    patch = AlignPatch(rect=bounds_of(lasso), offsets={"b": (5.0, 0.0)},
+                       polygon=lasso)
+    out = apply_patches([anchor, raster], ["a", "b"], [patch], dpi=72)
+
+    assert (out[1][20:30, 25:35] == 0).all(), "enclosed mark should have shifted"
+    assert (out[1][20:30, 60:70] == 0).all(), "mark outside the lasso must not move"
+
+
+def test_patch_without_a_polygon_still_moves_the_whole_box() -> None:
+    raster = np.full((60, 60), 255, dtype=np.uint8)
+    raster[10:20, 10:20] = 0
+    anchor = np.full((60, 60), 255, dtype=np.uint8)
+
+    patch = AlignPatch(rect=(0.0, 0.0, 60.0, 60.0), offsets={"b": (4.0, 0.0)})
+    out = apply_patches([anchor, raster], ["a", "b"], [patch], dpi=72)
+    assert (out[1][10:20, 14:24] == 0).all()
+
+
+def test_align_patch_round_trips_its_polygon() -> None:
+    lasso = [(1.0, 2.0), (3.0, 4.0), (5.0, 1.0)]
+    patch = AlignPatch(rect=bounds_of(lasso), offsets={"b": (1.0, 2.0)},
+                       polygon=lasso)
+    assert AlignPatch.from_dict(patch.to_dict()) == patch
+
+
+def test_bounds_of_is_the_enclosing_box() -> None:
+    assert bounds_of([(5.0, 9.0), (1.0, 2.0), (3.0, 7.0)]) == (1.0, 2.0, 5.0, 9.0)
+
+
+def test_lasso_avoids_the_collateral_a_box_causes(tmp_path) -> None:
+    """The motivating case. A box region drawn near the sheet frame drags that
+    frame into one document and not the other, manufacturing a difference where
+    there was none. A lasso around the label alone does not."""
+    from redliner.core.documents import load_document
+
+    base, drift = _jitter_pair(tmp_path, offset=(3.0, 2.0))
+    project = Project(dpi=150)
+    project.settings = DiffSettings(highlight=False)
+    project.add_document(load_document(base, "base", "base"))
+    project.add_document(load_document(drift, "drift", "drift"))
+    drift_id = project.docs[1].doc_id
+
+    def chromatic(rgb: np.ndarray) -> int:
+        flat = rgb.reshape(-1, 3).astype(int)
+        return int(((flat.max(axis=1) - flat.min(axis=1)) > 40).sum())
+
+    # A region whose right edge runs past the frame line at x=572.
+    greedy = (360.0, 178.0, 590.0, 214.0)
+    project.pages[0].patches = [
+        AlignPatch(rect=greedy, offsets={drift_id: (-3.0, -2.0)})
+    ]
+    with_box = chromatic(project.render(0))
+
+    # The same correction, but enclosing only the note text.
+    lasso = [(362.0, 180.0), (556.0, 180.0), (556.0, 212.0), (362.0, 212.0)]
+    project.pages[0].patches = [
+        AlignPatch(rect=greedy, offsets={drift_id: (-3.0, -2.0)}, polygon=lasso)
+    ]
+    with_lasso = chromatic(project.render(0))
+
+    assert with_box > 0, "the greedy box should drag the frame and show colour"
+    assert with_lasso < with_box, (
+        f"the lasso should leave less collateral: box={with_box} lasso={with_lasso}"
+    )

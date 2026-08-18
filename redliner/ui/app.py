@@ -21,11 +21,11 @@ from nicegui import app, events, run, ui
 from ..core.compose import DiffSettings
 from ..core.documents import (PDF_UNITS_PER_INCH, SourceDoc, clear_cache,
                               load_document, raster_to_data_url, thumbnail)
-from ..core.align import (AlignPatch, auto_align, normalize_rect,
-                          search_radius)
+from ..core.align import (AlignPatch, auto_align, bounds_of,
+                          normalize_rect, polygon_mask, search_radius)
 from ..core.compose import to_ink
 from ..core.export import ExportOptions, build_pdf, estimate_pixels
-from ..core.markup import FONTS, Shape, to_svg
+from ..core.markup import FONTS, Shape, simplify, to_svg
 from ..core.project import Project, hex_to_rgb, rgb_to_hex
 from ..core import shares
 from .share_routes import SHARE_PREFIX, register as register_share_routes
@@ -76,8 +76,9 @@ class Session:
         self.markup_fill: str | None = None   # None == transparent
         self.markup_font = "sans"
         self.markup_boxed = False
-        #: Index into the current page's markups, or None.
-        self.selected: int | None = None
+        #: Indices into the current page's markups. Ordered so the most
+        #: recently picked shape is the one whose properties the panel shows.
+        self.selected: list[int] = []
         self._shape_drag: dict = {"id": None, "points": None}
         # Set while an align dialog is open. The drag and keyboard listeners are
         # registered once per client and routed here, rather than re-registered
@@ -347,8 +348,7 @@ class Session:
         page = self.current_page()
         if self.viewer is None or page is None:
             return
-        if self.selected is not None and self.selected >= len(page.markups):
-            self.selected = None
+        self.selected = [i for i in self.selected if 0 <= i < len(page.markups)]
         width_pt, height_pt = self.project.page_size_points(self.index)
         self.viewer.set_page_size(width_pt, height_pt)
         self.viewer.set_markup(
@@ -357,24 +357,42 @@ class Session:
     def select_tool(self, tool: str) -> None:
         self.tool = tool
         if tool != "select":
-            self.selected = None
+            self.selected = []
             self.refresh_markup()
-        self.viewer.set_tool(tool, self.markup_color, self.markup_width)
+        # The gesture goes with it, so the browser knows to accumulate a
+        # freehand trail without hardcoding which tools are freehand.
+        chosen = TOOLS.get(tool)
+        self.viewer.set_tool(tool, self.markup_color, self.markup_width,
+                             getattr(chosen, "gesture", "drag"))
         self.tool_panel.refresh()
         self.markup_panel.refresh()
 
     # -- selection -------------------------------------------------------
 
-    def selected_shape(self) -> Shape | None:
+    def selected_shapes(self) -> list[Shape]:
         page = self.current_page()
-        if page is None or self.selected is None:
-            return None
-        if 0 <= self.selected < len(page.markups):
-            return page.markups[self.selected]
-        return None
+        if page is None:
+            return []
+        return [page.markups[i] for i in self.selected if 0 <= i < len(page.markups)]
 
-    def pick_markup(self, index: int | None) -> None:
-        self.selected = index
+    def selected_shape(self) -> Shape | None:
+        """The shape the property panel describes: the last one picked."""
+        shapes = self.selected_shapes()
+        return shapes[-1] if shapes else None
+
+    def pick_markup(self, index: int | None, additive: bool = False) -> None:
+        if index is None:
+            self.selected = [] if not additive else self.selected
+        elif additive:
+            # Shift-click toggles, so a mis-click is undone the same way it was
+            # made rather than by starting the selection over.
+            if index in self.selected:
+                self.selected.remove(index)
+            else:
+                self.selected.append(index)
+        else:
+            self.selected = [index]
+
         # Loading the shape's own properties into the panel means the controls
         # describe what is selected, so editing one does not silently reset the
         # others to whatever was last used for drawing.
@@ -382,24 +400,51 @@ class Session:
         self.refresh_markup()
         self.markup_panel.refresh()
 
-    def drag_markup(self, payload: dict) -> None:
-        """Move the selected shape, or one of its handles, by a live delta."""
-        shape = self.selected_shape()
-        if shape is None:
+    def select_within(self, rect: tuple[float, float, float, float],
+                      additive: bool = False) -> None:
+        """Rubber-band selection: every shape whose box meets `rect`."""
+        page = self.current_page()
+        if page is None:
             return
+        x0, y0, x1, y1 = normalize_rect(rect)
+        hits = []
+        for index, shape in enumerate(page.markups):
+            bx0, by0, bx1, by1 = shape.bbox()
+            if bx1 >= x0 and bx0 <= x1 and by1 >= y0 and by0 <= y1:
+                hits.append(index)
+
+        if additive:
+            for index in hits:
+                if index not in self.selected:
+                    self.selected.append(index)
+        else:
+            self.selected = hits
+        self.adopt_selection_properties()
+        self.refresh_markup()
+        self.markup_panel.refresh()
+
+    def drag_markup(self, payload: dict) -> None:
+        """Move the selection, or resize one shape by a handle, by a live delta."""
+        shapes = self.selected_shapes()
+        if not shapes:
+            return
+        shape = shapes[-1]
 
         # A new drag id means a new gesture: snapshot the geometry it started
         # from, because the deltas that follow are cumulative from that point.
         if self._shape_drag["id"] != payload.get("drag"):
             self._shape_drag = {"id": payload.get("drag"),
-                                "points": list(shape.points)}
+                                "points": list(shape.points),
+                                "all": [list(s.points) for s in shapes]}
 
         origin = self._shape_drag["points"] or []
         dx, dy = float(payload.get("dx", 0.0)), float(payload.get("dy", 0.0))
         handle = payload.get("handle")
 
         if not handle:
-            shape.points = [(x + dx, y + dy) for x, y in origin]
+            # Move the whole selection together, each from its own snapshot.
+            for target, start in zip(shapes, self._shape_drag.get("all", [])):
+                target.points = [(x + dx, y + dy) for x, y in start]
         elif handle.startswith("p") and len(origin) >= 2:
             # Line and arrow endpoints.
             end = 0 if handle == "p0" else len(origin) - 1
@@ -423,30 +468,36 @@ class Session:
 
     def delete_selected(self) -> None:
         page = self.current_page()
-        if page is None or self.selected is None:
+        if page is None or not self.selected:
             return
-        if 0 <= self.selected < len(page.markups):
-            page.markups.pop(self.selected)
-        self.selected = None
+        # Highest index first: popping low indices first would shift the ones
+        # still to be removed and delete the wrong shapes.
+        for index in sorted(self.selected, reverse=True):
+            if 0 <= index < len(page.markups):
+                page.markups.pop(index)
+        self.selected = []
         self.refresh_markup()
         self.markup_panel.refresh()
 
     def nudge_selected(self, dx: float, dy: float) -> None:
-        shape = self.selected_shape()
-        if shape is not None:
+        shapes = self.selected_shapes()
+        for shape in shapes:
             shape.translate(dx, dy)
+        if shapes:
             self.refresh_markup()
 
     def apply_to_selection(self) -> None:
         """Push the current markup properties onto the selected shape."""
-        shape = self.selected_shape()
-        if shape is None:
+        shapes = self.selected_shapes()
+        if not shapes:
             return
-        shape.color = hex_to_rgb(self.markup_color)
-        shape.width = self.markup_width
-        shape.fill = None if self.markup_fill is None else hex_to_rgb(self.markup_fill)
-        shape.font = self.markup_font
-        shape.boxed = self.markup_boxed
+        for shape in shapes:
+            shape.color = hex_to_rgb(self.markup_color)
+            shape.width = self.markup_width
+            shape.fill = (None if self.markup_fill is None
+                          else hex_to_rgb(self.markup_fill))
+            shape.font = self.markup_font
+            shape.boxed = self.markup_boxed
         self.refresh_markup()
 
     def adopt_selection_properties(self) -> None:
@@ -472,9 +523,10 @@ class Session:
             return
 
         if kind == "align":
-            if len(points) >= 2:
-                self.open_align_dialog((points[0][0], points[0][1],
-                                        points[1][0], points[1][1]))
+            # A lasso: thin the outline, then align within it.
+            outline = simplify(points, tolerance=1.0)
+            if len(outline) >= 3:
+                self.open_align_dialog(bounds_of(outline), polygon=outline)
             return
 
         # Everything else is the registered tool's business: it decides what
@@ -553,7 +605,7 @@ class Session:
         page = self.current_page()
         if page is None or not 0 <= index < len(page.markups):
             return
-        self.selected = index
+        self.selected = [index]
         shape = page.markups[index]
         if shape.kind == "text":
             self.ask_for_text(shape=shape)
@@ -596,7 +648,9 @@ class Session:
                 self.nudge_selected(dx * scale, dy * scale)
                 return
 
-    def open_align_dialog(self, rect: tuple[float, float, float, float]) -> None:
+    def open_align_dialog(self, rect: tuple[float, float, float, float],
+                          polygon: list[tuple[float, float]] | None = None
+                          ) -> None:
         """Correct a local misalignment inside `rect`.
 
         The preview is difference-only: shared ink drops out, so a few pixels of
@@ -624,6 +678,7 @@ class Session:
         )
         if existing is not None:
             rect = normalize_rect(existing.rect)
+            polygon = existing.polygon
 
         dpi = self._align_dpi(rect)
         step = PDF_UNITS_PER_INCH / dpi  # one preview pixel, in points
@@ -644,7 +699,7 @@ class Session:
             token = generation["n"]
             try:
                 rgb = await run.io_bound(self.project.render_region, self.index,
-                                         rect, dpi, dict(offsets))
+                                         rect, dpi, dict(offsets), polygon)
                 url = await run.io_bound(raster_to_data_url, rgb)
             except Exception as exc:
                 ui.notify(f"Align preview failed: {exc}", type="negative")
@@ -688,6 +743,12 @@ class Session:
             crops = await run.io_bound(self.project.region_rasters,
                                        self.index, rect, dpi, None)
             inks = [to_ink(c) for c in crops]
+            # Ink outside the lasso is not ours to align against, and letting it
+            # into the correlation would pull the answer toward whatever the
+            # surrounding geometry happens to do.
+            mask = self.project.region_mask(rect, dpi, polygon, inks[0].shape)
+            if mask is not None:
+                inks = [ink * mask for ink in inks]
             radius = search_radius(inks[0].shape[1], inks[0].shape[0])
             shifts = await run.io_bound(auto_align, inks, radius)
             for doc, (dx, dy) in zip(docs, shifts):
@@ -707,7 +768,8 @@ class Session:
         def apply() -> None:
             if existing is not None:
                 page.patches.remove(existing)
-            patch = AlignPatch(rect=rect, offsets=dict(offsets))
+            patch = AlignPatch(rect=rect, offsets=dict(offsets),
+                               polygon=polygon)
             if not patch.is_identity():
                 page.patches.append(patch)
             close()
@@ -906,8 +968,11 @@ def build_page(session: Session) -> None:
         ui.space()
         session.progress = ui.spinner(size="sm")
         session.progress.set_visibility(False)
+        # `color=white` is required: a flat button defaults to the primary
+        # colour, which on the primary-coloured header is the same blue as the
+        # bar behind it and reads as invisible.
         ui.button("Share", icon="link", on_click=session.share) \
-            .props("flat").tooltip("Publish to a temporary link")
+            .props("flat color=white").tooltip("Publish to a temporary link")
         ui.button("Export PDF", icon="download", on_click=session.export) \
             .props("unelevated color=primary")
 
@@ -1034,8 +1099,10 @@ def build_page(session: Session) -> None:
                     # Property edits retarget the selection when there is one,
                     # and otherwise set the defaults for the next shape drawn.
                     session.apply_to_selection()
+                    chosen = TOOLS.get(session.tool)
                     session.viewer.set_tool(session.tool, session.markup_color,
-                                            session.markup_width)
+                                            session.markup_width,
+                                            getattr(chosen, "gesture", "drag"))
 
                 with ui.row().classes("items-center gap-2 w-full no-wrap"):
                     ui.label("Stroke").classes("text-xs opacity-70 w-12")
@@ -1221,7 +1288,7 @@ def build_page(session: Session) -> None:
                         session.viewer = ZoomPanViewer(
                             on_zoom=session.on_zoom, on_shape=session.on_shape,
                             on_pick=session.pick_markup, on_drag=session.drag_markup,
-                            on_edit=session.edit_markup,
+                            on_edit=session.edit_markup, on_band=session.select_within,
                         )
 
             with ui.tab_panel(align_tab).classes("p-3 h-full overflow-auto"):

@@ -258,12 +258,24 @@ def register_shape(kind: str, svg=None, pdf=None) -> None:
 # -- SVG ----------------------------------------------------------------
 
 def to_svg(shapes: list[Shape], width_pt: float, height_pt: float,
-           selected: int | None = None) -> str:
+           selected: int | list[int] | None = None) -> str:
     """Render shapes as an SVG whose user units are PDF points.
 
     Each shape is wrapped in a group carrying its index and bounding box so the
     browser can hit-test and drag it without asking the server where things are.
+
+    `selected` may be one index or several. Resize handles are offered only for
+    a single selection -- with several picked, the browser marks the last one as
+    the handle owner, and a corner drag would otherwise have to mean something
+    for every shape at once.
     """
+    if selected is None:
+        chosen: list[int] = []
+    elif isinstance(selected, int):
+        chosen = [selected]
+    else:
+        chosen = list(selected)
+    primary = chosen[-1] if len(chosen) == 1 else None
     parts = [
         f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {width_pt:.2f} {height_pt:.2f}" '
         f'width="100%" height="100%" style="position:absolute;inset:0;overflow:visible">'
@@ -277,13 +289,17 @@ def to_svg(shapes: list[Shape], width_pt: float, height_pt: float,
             ends = (shape.points[0], shape.points[-1])
             endpoints = ' data-points="' + " ".join(
                 f"{x:.2f},{y:.2f}" for x, y in ends) + '"'
+        marker = ""
+        if index == primary:
+            marker = ' data-selected="1"'
+        elif index in chosen:
+            marker = ' data-picked="1"'
         parts.append(
             f'<g data-idx="{index}" data-bbox="{x0:.2f},{y0:.2f},{x1:.2f},{y1:.2f}" '
-            f'data-kind="{shape.kind}"{endpoints}'
-            f'{" data-selected=\"1\"" if index == selected else ""}>'
+            f'data-kind="{shape.kind}"{endpoints}{marker}>'
             f"{_hit_svg(shape)}{_shape_svg(shape)}</g>"
         )
-        if index == selected:
+        if index in chosen:
             parts.append(
                 f'<rect class="rl-ants" x="{x0:.2f}" y="{y0:.2f}" '
                 f'width="{max(0.1, x1 - x0):.2f}" height="{max(0.1, y1 - y0):.2f}" '

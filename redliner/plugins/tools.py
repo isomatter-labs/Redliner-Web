@@ -176,10 +176,19 @@ class TextTool(MarkupTool):
 
 @TOOLS.register
 class AlignTool(MarkupTool):
+    """Lasso a drifting element and correct it.
+
+    Freehand rather than a box because the region's edge matters: shifting
+    pulls in whatever lies just outside the outline, so a box that happens to
+    graze a frame line drags that line into one document and not the other.
+    A blob drawn around the errant label alone avoids that entirely.
+    """
+
     name = "align"
     icon = "open_with"
-    tooltip = "Magic align — correct a local misalignment"
+    tooltip = "Magic align — lasso a misaligned area"
     priority = 80
+    gesture = "freehand"
     opens_dialog = True
 
 

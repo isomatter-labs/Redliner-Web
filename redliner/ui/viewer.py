@@ -195,7 +195,14 @@ window.RedlinerViewer = (function () {
     const stroke = `stroke="${col}" stroke-width="${w}" fill="none"
                     stroke-linecap="round" stroke-linejoin="round" class="rl-ants"`;
     let body = '';
-    if (v.tool === 'pencil') {
+    if (v.tool === 'align') {
+      // Closed and tinted while dragging, so the lasso reads as an area being
+      // enclosed rather than a line being drawn.
+      const path = (trail || []).map(p => `${p[0]},${p[1]}`).join(' ');
+      body = `<polygon points="${path}" stroke="#2196f3" stroke-width="${w}"
+               fill="#2196f3" fill-opacity="0.12" class="rl-ants"
+               stroke-linejoin="round"/>`;
+    } else if (v.toolGesture === 'freehand') {
       const path = (trail || []).map(p => `${p[0]},${p[1]}`).join(' ');
       body = `<polyline points="${path}" stroke="${col}" stroke-width="${w}"
                fill="none" stroke-linecap="round" stroke-linejoin="round"/>`;
@@ -234,6 +241,7 @@ window.RedlinerViewer = (function () {
       const v = {id, root, img: null, overlay: null, preview: null,
                  scale: 1, tx: 0, ty: 0, base: 0, timer: null,
                  tool: null, toolColor: '#d90000', toolWidth: 1.5,
+                 toolGesture: 'drag',
                  wPt: 0, hPt: 0,
                  // Gesture state: `frozen` pins the screen<->points mapping for
                  // the duration of a drag, `gesture` defers zoom reports.
@@ -280,6 +288,7 @@ window.RedlinerViewer = (function () {
       }, {passive: false});
 
       let mode = null, lx = 0, ly = 0, from = null, trail = [];
+      let bandFrom = null, bandAdditive = false;
       let dragId = 0, dragHandle = null, ox = 0, oy = 0;
 
       root.addEventListener('pointerdown', (e) => {
@@ -299,12 +308,29 @@ window.RedlinerViewer = (function () {
             return;
           }
           const group = e.target.closest && e.target.closest('g[data-idx]');
-          emitEvent('markup_pick', {id: v.id, idx: group ? +group.dataset.idx : null});
           if (group) {
-            mode = 'shape'; dragHandle = null;
-            dragId += 1; ox = e.clientX; oy = e.clientY;
+            const index = +group.dataset.idx;
+            const already = group.dataset.selected === '1' ||
+                            group.dataset.picked === '1';
+            // Dragging one shape of a multi-selection should move the group,
+            // not silently reduce the selection to whatever was grabbed.
+            if (!already || e.shiftKey) {
+              emitEvent('markup_pick', {id: v.id, idx: index, additive: e.shiftKey});
+            }
+            if (!e.shiftKey) {
+              mode = 'shape'; dragHandle = null;
+              dragId += 1; ox = e.clientX; oy = e.clientY;
+              v.gesture = true;
+              freezeMapping(v);
+            }
+          } else {
+            // Empty space: start a rubber band. A plain click that never moves
+            // clears the selection, which stop() handles.
+            mode = 'band';
             v.gesture = true;
             freezeMapping(v);
+            bandFrom = toPoints(v, e.clientX, e.clientY);
+            bandAdditive = e.shiftKey;
           }
           return;
         }
@@ -334,8 +360,21 @@ window.RedlinerViewer = (function () {
           apply(v);
         } else if (mode === 'draw' && v.preview) {
           const now = toPoints(v, e.clientX, e.clientY);
-          if (v.tool === 'pencil') trail.push(now);
+          if (v.toolGesture === 'freehand') trail.push(now);
           v.preview.innerHTML = previewSvg(v, from, now, trail);
+        } else if (mode === 'band' && v.preview) {
+          const now = toPoints(v, e.clientX, e.clientY);
+          v.preview.innerHTML =
+            `<svg xmlns="http://www.w3.org/2000/svg"
+              viewBox="0 0 ${v.wPt} ${v.hPt}" width="100%" height="100%"
+              style="position:absolute;inset:0;overflow:visible">
+              <rect x="${Math.min(bandFrom[0], now[0])}"
+                    y="${Math.min(bandFrom[1], now[1])}"
+                    width="${Math.abs(now[0] - bandFrom[0])}"
+                    height="${Math.abs(now[1] - bandFrom[1])}"
+                    fill="#2196f3" fill-opacity="0.10" stroke="#2196f3"
+                    stroke-width="1" vector-effect="non-scaling-stroke"
+                    class="rl-ants"/></svg>`;
         } else if (mode === 'shape' || mode === 'handle') {
           // Cumulative delta, so a throttled or dropped update never loses
           // movement -- the next one carries the whole offset.
@@ -351,16 +390,26 @@ window.RedlinerViewer = (function () {
         if (mode === 'draw' && from) {
           const to = toPoints(v, e.clientX, e.clientY);
           if (v.preview) v.preview.innerHTML = '';
-          if (v.tool === 'pencil') {
+          if (v.toolGesture === 'freehand') {
             if (trail.length > 2) {
-              emitEvent('viewer_shape', {id: v.id, kind: 'pencil', points: trail});
+              emitEvent('viewer_shape', {id: v.id, kind: v.tool, points: trail});
             }
           } else if (Math.hypot(to[0] - from[0], to[1] - from[1]) > 2) {
             emitEvent('viewer_shape', {id: v.id, kind: v.tool, points: [from, to]});
           }
         }
+        if (mode === 'band' && bandFrom) {
+          if (v.preview) v.preview.innerHTML = '';
+          const to = toPoints(v, e.clientX, e.clientY);
+          if (Math.abs(to[0] - bandFrom[0]) > 2 || Math.abs(to[1] - bandFrom[1]) > 2) {
+            emitEvent('markup_band', {id: v.id, additive: bandAdditive,
+                                      rect: [bandFrom[0], bandFrom[1], to[0], to[1]]});
+          } else if (!bandAdditive) {
+            emitEvent('markup_pick', {id: v.id, idx: null, additive: false});
+          }
+        }
         if (mode === 'pan') root.style.cursor = v.tool && v.tool !== 'pan' ? 'crosshair' : 'grab';
-        mode = null; from = null; trail = []; dragHandle = null;
+        mode = null; from = null; trail = []; dragHandle = null; bandFrom = null;
 
         // The gesture is over: unfreeze, and deliver any zoom report that was
         // held back so the sharper render still arrives.
@@ -391,10 +440,11 @@ window.RedlinerViewer = (function () {
       v.wPt = wPt; v.hPt = hPt;
       apply(v);
     },
-    setTool(id, tool, color, width) {
+    setTool(id, tool, color, width, gesture) {
       const v = views[id];
       if (!v) return;
       v.tool = tool; v.toolColor = color; v.toolWidth = width;
+      v.toolGesture = gesture || 'drag';
       v.root.style.cursor = tool === 'select' ? 'default'
         : (tool && tool !== 'pan' ? 'crosshair' : 'grab');
       // The overlay only intercepts clicks while selecting; otherwise it would
@@ -486,7 +536,8 @@ class ZoomPanViewer:
 
     def __init__(self, on_zoom: Callable[[float], None] | None = None,
                  on_shape: Callable[[dict], None] | None = None,
-                 on_pick: Callable[[int | None], None] | None = None,
+                 on_pick: Callable[[int | None, bool], None] | None = None,
+                 on_band: Callable[[tuple, bool], None] | None = None,
                  on_drag: Callable[[dict], None] | None = None,
                  on_edit: Callable[[int], None] | None = None) -> None:
         install()
@@ -495,6 +546,7 @@ class ZoomPanViewer:
         self._on_zoom = on_zoom
         self._on_shape = on_shape
         self._on_pick = on_pick
+        self._on_band = on_band
         self._on_drag = on_drag
         self._on_edit = on_edit
 
@@ -515,6 +567,7 @@ class ZoomPanViewer:
         ui.on("viewer_zoom", self._handle_zoom)
         ui.on("viewer_shape", self._handle_shape)
         ui.on("markup_pick", self._handle_pick)
+        ui.on("markup_band", self._handle_band)
         ui.on("markup_drag", self._handle_drag, throttle=0.05)
         ui.on("markup_edit", self._handle_edit)
 
@@ -540,7 +593,15 @@ class ZoomPanViewer:
         payload = self._mine(event)
         if payload and self._on_pick:
             index = payload.get("idx")
-            self._on_pick(None if index is None else int(index))
+            self._on_pick(None if index is None else int(index),
+                          bool(payload.get("additive")))
+
+    def _handle_band(self, event) -> None:
+        payload = self._mine(event)
+        if payload and self._on_band:
+            rect = payload.get("rect") or [0, 0, 0, 0]
+            self._on_band(tuple(float(v) for v in rect),
+                          bool(payload.get("additive")))
 
     def _handle_drag(self, event) -> None:
         payload = self._mine(event)
@@ -577,10 +638,11 @@ class ZoomPanViewer:
         # were positioned against the old nodes have to be rebuilt.
         ui.run_javascript(f"RedlinerViewer.refresh('{self.element_id}')")
 
-    def set_tool(self, tool: str, color: str, width: float) -> None:
+    def set_tool(self, tool: str, color: str, width: float,
+                 gesture: str = "drag") -> None:
         ui.run_javascript(
             f"RedlinerViewer.setTool('{self.element_id}', "
-            f"'{tool}', '{color}', {width})"
+            f"'{tool}', '{color}', {width}, '{gesture}')"
         )
 
     def fit(self) -> None:

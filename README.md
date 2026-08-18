@@ -182,8 +182,8 @@ saves. That is not a design change, but a per-pixel diff cannot tell the
 difference, and the drift is often visually louder than the revision you are
 actually looking for.
 
-Draw a region with the align tool and a dialog opens showing just that region,
-rendered **difference-only**: ink both documents agree on drops out entirely, so
+Lasso the drifting element with the align tool and a dialog opens showing just
+that region, rendered **difference-only**: ink both documents agree on drops out entirely, so
 drift appears as two coloured ghosts of the same shape and the job is simply to
 make them cancel. Auto-align runs on open; you can then drag the preview or use
 the arrow keys (Shift for 5 px steps) to adjust. The first document is the
@@ -191,8 +191,9 @@ anchor and never moves.
 
 Three things make it work:
 
-- **Offsets are region-scoped.** Only pixels inside the rectangle move, so
-  correcting one drifting label never disturbs the rest of the sheet.
+- **Offsets are region-scoped, and the region is a freehand blob.** Only pixels
+  inside the outline move, so correcting one drifting label never disturbs the
+  rest of the sheet -- not even a frame line running right beside it.
 - **Auto-align is FFT cross-correlation**, not a brute-force shift sweep —
   O(n log n) against O(n·r²), which matters because the search radius scales
   with the region you drew. The inputs are mean-subtracted first: raw
@@ -217,11 +218,15 @@ Three things make it work:
 Rasterized (non-PDF) inputs have no vector source to re-render, so they fall
 back to whole-pixel shifting.
 
-**Draw the region so its edges fall on blank paper.** Shifting the window pulls
-in whatever lies just outside it, so an edge grazing a frame line drags that
-line into one document and not the other — manufacturing a difference exactly
-where you were trying to remove one. The difference-only preview shows this
-immediately: collateral geometry lights up in colour.
+**Enclose everything that drifted together, and nothing else.** Only what the
+lasso contains moves, so an outline cutting through the middle of a box will
+correct the text inside it and leave the box edges behind. The difference-only
+preview shows this immediately: anything left behind stays coloured.
+
+This is why the region is freehand rather than a rectangle. On the test fixture,
+correcting a 3 pt drift with a box whose edge grazes the sheet frame leaves 450
+differing pixels — the frame itself, dragged out of alignment. The same
+correction inside a lasso around the label alone leaves **zero**.
 
 ## Not built yet
 
@@ -232,7 +237,7 @@ immediately: collateral geometry lights up in colour.
   "same path" has to be decided geometrically, not by comparing streams. Worth
   scoping separately. Note that the searchable-text-layer work above already
   delivers one of its main benefits (text-searchable output).
-- Multi-select and grouping of markup; shapes are selected one at a time.
+- Grouping markup, and rotating it.
 - Rotating markup, and resizing freehand strokes (they move but do not scale).
 - Whole-page alignment. Offsets are region-scoped only; a sheet that drifted
   bodily needs one region covering it.

@@ -20,8 +20,9 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 
 import numpy as np
+from PIL import Image, ImageDraw
 
-from .documents import PDF_UNITS_PER_INCH
+from .units import PDF_UNITS_PER_INCH
 
 Rect = tuple[float, float, float, float]
 
@@ -41,25 +42,64 @@ MIN_INK = 1e-4
 
 @dataclass(slots=True)
 class AlignPatch:
-    """A rectangle, in PDF points, plus a per-document offset in points."""
+    """A region, in PDF points, plus a per-document offset in points.
+
+    `rect` is always the bounding box. `polygon` optionally narrows the region
+    to a freehand outline inside it -- a lasso drawn around one drifting label
+    rather than a box that also swallows the frame line beside it. Only pixels
+    inside the polygon move.
+    """
 
     rect: Rect
     offsets: dict[str, tuple[float, float]] = field(default_factory=dict)
+    polygon: list[tuple[float, float]] | None = None
 
     def to_dict(self) -> dict:
-        return {"rect": list(self.rect),
-                "offsets": {k: list(v) for k, v in self.offsets.items()}}
+        return {
+            "rect": list(self.rect),
+            "offsets": {k: list(v) for k, v in self.offsets.items()},
+            "polygon": None if self.polygon is None
+            else [list(p) for p in self.polygon],
+        }
 
     @classmethod
     def from_dict(cls, data: dict) -> AlignPatch:
+        polygon = data.get("polygon")
         return cls(
             rect=tuple(float(v) for v in data["rect"]),  # type: ignore[arg-type]
             offsets={k: (float(v[0]), float(v[1]))
                      for k, v in data.get("offsets", {}).items()},
+            polygon=None if polygon is None
+            else [(float(x), float(y)) for x, y in polygon],
         )
 
     def is_identity(self) -> bool:
         return all(dx == 0 and dy == 0 for dx, dy in self.offsets.values())
+
+
+def bounds_of(points: list[tuple[float, float]]) -> Rect:
+    xs = [p[0] for p in points]
+    ys = [p[1] for p in points]
+    return (min(xs), min(ys), max(xs), max(ys))
+
+
+def polygon_mask(polygon: list[tuple[float, float]], origin: tuple[float, float],
+                 dpi: float, shape: tuple[int, int]) -> np.ndarray:
+    """Rasterize a point-space polygon into a boolean mask of `shape`.
+
+    `origin` is the top-left of the destination window in points, so the
+    polygon's own coordinates are translated into that window.
+    """
+    height, width = shape
+    if height <= 0 or width <= 0 or len(polygon) < 3:
+        return np.ones((max(0, height), max(0, width)), dtype=bool)
+
+    scale = dpi / PDF_UNITS_PER_INCH
+    flat = [((x - origin[0]) * scale, (y - origin[1]) * scale) for x, y in polygon]
+
+    image = Image.new("1", (width, height), 0)
+    ImageDraw.Draw(image).polygon(flat, fill=1, outline=1)
+    return np.array(image, dtype=bool)
 
 
 def normalize_rect(rect: Rect) -> Rect:
@@ -243,6 +283,18 @@ def apply_patches(rasters: list[np.ndarray], doc_ids: list[str],
 
             rows = min(patch_raster.shape[0], clip_bottom - clip_top)
             cols = min(patch_raster.shape[1], clip_right - clip_left)
-            out[index][clip_top : clip_top + rows, clip_left : clip_left + cols] = \
-                patch_raster[:rows, :cols]
+            destination = out[index][clip_top : clip_top + rows,
+                                     clip_left : clip_left + cols]
+
+            if patch.polygon is None:
+                destination[...] = patch_raster[:rows, :cols]
+            else:
+                # A lasso moves only what it encloses. Copying through the mask
+                # leaves everything else exactly as it was, which is the whole
+                # point of drawing a blob rather than a box: a frame line
+                # passing beside the drifting label stays put.
+                mask = polygon_mask(patch.polygon,
+                                    (clip_left / scale, clip_top / scale),
+                                    dpi, (rows, cols))
+                np.copyto(destination, patch_raster[:rows, :cols], where=mask)
     return out

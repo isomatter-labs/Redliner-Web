@@ -284,3 +284,43 @@ def test_markup_position_is_independent_of_render_dpi() -> None:
     assert abs(rects[0].x0 - rects[1].x0) < 1
     assert abs(rects[0].y0 - rects[1].y0) < 1
     assert abs(rects[0].width - rects[1].width) < 1
+
+
+# -- multi-selection ----------------------------------------------------
+
+def _three() -> list[Shape]:
+    return [
+        Shape(kind="rect", points=[(0.0, 0.0), (10.0, 10.0)]),
+        Shape(kind="rect", points=[(20.0, 20.0), (30.0, 30.0)]),
+        Shape(kind="rect", points=[(40.0, 40.0), (50.0, 50.0)]),
+    ]
+
+
+def test_several_shapes_can_be_marked_selected() -> None:
+    svg = to_svg(_three(), 100, 100, selected=[0, 2])
+    assert svg.count("rl-ants") == 2, "both picks should be outlined"
+
+
+def test_handles_are_offered_only_for_a_single_selection() -> None:
+    """With several picked, a corner drag has no single meaning, so the browser
+    is given no handle owner."""
+    one = to_svg(_three(), 100, 100, selected=[1])
+    many = to_svg(_three(), 100, 100, selected=[0, 1])
+
+    assert 'data-selected="1"' in one
+    assert 'data-selected="1"' not in many
+    assert many.count('data-picked="1"') == 2
+
+
+def test_a_bare_index_still_works() -> None:
+    """The single-selection call site predates multi-select."""
+    svg = to_svg(_three(), 100, 100, selected=1)
+    assert 'data-selected="1"' in svg
+    assert svg.count("rl-ants") == 1
+
+
+def test_no_selection_marks_nothing() -> None:
+    svg = to_svg(_three(), 100, 100, selected=None)
+    assert "data-selected" not in svg
+    assert "data-picked" not in svg
+    assert "rl-ants" not in svg

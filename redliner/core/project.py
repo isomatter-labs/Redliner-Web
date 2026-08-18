@@ -15,7 +15,8 @@ from dataclasses import dataclass, field
 
 import numpy as np
 
-from .align import AlignPatch, apply_patches, normalize_rect, window
+from .align import (AlignPatch, apply_patches, normalize_rect,
+                    polygon_mask, window)
 from .compose import DiffSettings, Layer, align, composite
 from .documents import (PDF_UNITS_PER_INCH, SourceDoc, blank_like,
                         rasterize, rasterize_clip)
@@ -234,12 +235,30 @@ class Project:
         return [c if c.shape == target
                 else window(c, 0, 0, target[1], target[0]) for c in crops]
 
+    def region_mask(self, rect: tuple[float, float, float, float], dpi: float,
+                    polygon: list[tuple[float, float]] | None,
+                    shape: tuple[int, int]) -> np.ndarray | None:
+        """Boolean mask of a lasso within a region crop, or None for the whole box."""
+        if polygon is None:
+            return None
+        x0, y0, _, _ = normalize_rect(rect)
+        return polygon_mask(polygon, (x0, y0), dpi, shape)
+
     def render_region(self, index: int, rect: tuple[float, float, float, float],
                       dpi: float,
-                      offsets: dict[str, tuple[float, float]] | None = None
+                      offsets: dict[str, tuple[float, float]] | None = None,
+                      polygon: list[tuple[float, float]] | None = None
                       ) -> np.ndarray:
-        """Difference-only composite of one region, for the align dialog."""
+        """Difference-only composite of one region, for the align dialog.
+
+        Outside a lasso the crop is replaced with bare paper, so the preview
+        shows only what the correction will actually touch -- otherwise the
+        surrounding geometry reads as difference the user cannot fix from here.
+        """
         crops = self.region_rasters(index, rect, dpi, offsets)
+        mask = self.region_mask(rect, dpi, polygon, crops[0].shape) if crops else None
+        if mask is not None:
+            crops = [np.where(mask, crop, 255) for crop in crops]
         settings = DiffSettings(highlight=False, show_unchanged=False,
                                 ink_floor=self.settings.ink_floor)
         layers = [Layer(ink=crop, color=doc.color)
